@@ -344,33 +344,35 @@ def get_proto_field(d, key, default=None):
 
 
 # ==================== PER-ACCOUNT MATCH COUNTER ====================
+# asyncio is single-threaded — dict operations between await points are
+# already atomic. The old global Lock was causing unnecessary context
+# switches (~10/s with 5 accounts) and serializing all account loops.
 _match_counters: Dict[str, int] = {}
-_match_counter_lock = asyncio.Lock()
 
-async def _inc_match(uid: str) -> int:
-    async with _match_counter_lock:
-        _match_counters[uid] = _match_counters.get(uid, 0) + 1
-        return _match_counters[uid]
+def _inc_match(uid: str) -> int:
+    _match_counters[uid] = _match_counters.get(uid, 0) + 1
+    return _match_counters[uid]
 
-async def _dec_match(uid: str) -> int:
-    async with _match_counter_lock:
-        if uid in _match_counters and _match_counters[uid] > 0:
-            _match_counters[uid] -= 1
-        return _match_counters.get(uid, 0)
+def _dec_match(uid: str) -> int:
+    if uid in _match_counters and _match_counters[uid] > 0:
+        _match_counters[uid] -= 1
+    return _match_counters.get(uid, 0)
 
-async def _get_match_count(uid: str) -> int:
-    async with _match_counter_lock:
-        return _match_counters.get(uid, 0)
+def _get_match_count(uid: str) -> int:
+    return _match_counters.get(uid, 0)
 
-async def _get_total_match_count() -> int:
-    async with _match_counter_lock:
-        return sum(_match_counters.values())
+def _get_total_match_count() -> int:
+    return sum(_match_counters.values())
+
 
 
 # ==================== TOKEN CACHE ====================
 _token_cache_memo: Dict[str, Any] = {}
 _token_cache_memo_time: float = 0.0
 _TOKEN_CACHE_MEMO_TTL = 5.0
+# Prevents simultaneous cache writes from overwriting each other
+# (race condition when 5+ accounts login at the same time)
+_cache_write_lock = asyncio.Lock()
 
 def _json_serializer(obj):
     if isinstance(obj, (bytes, bytearray)):
@@ -436,30 +438,43 @@ def cache_get(uid: str) -> Optional[Dict]:
         return None
     if time.time() - entry.get("cached_at", 0) > TOKEN_CACHE_TTL:
         print_info(f"[CACHE] UID {uid} expired. Re-login needed.")
-        cache_invalidate(uid)
+        # cache_invalidate is now async — schedule as fire-and-forget task
+        try:
+            asyncio.get_running_loop().create_task(cache_invalidate(uid))
+        except RuntimeError:
+            pass  # No event loop yet (startup path)
         return None
     if str(entry.get("account_id", "")).isdigit():
         entry["account_id"] = int(entry["account_id"])
     if not isinstance(entry.get("login_payload_data"), (bytes, bytearray)):
         print_warning(f"[CACHE] UID {uid} missing payload → invalidating")
-        cache_invalidate(uid)
+        try:
+            asyncio.get_running_loop().create_task(cache_invalidate(uid))
+        except RuntimeError:
+            pass
         return None
     return entry
 
-def cache_set(uid: str, account_data: Dict):
-    cache = _load_token_cache()
-    entry = dict(account_data)
-    entry["cached_at"] = time.time()
-    cache[str(uid)] = entry
-    _save_token_cache(cache)
+async def cache_set(uid: str, account_data: Dict):
+    """Thread-safe async cache write — prevents race-condition overwrites
+    when multiple accounts login simultaneously."""
+    async with _cache_write_lock:
+        cache = _load_token_cache()
+        entry = dict(account_data)
+        entry["cached_at"] = time.time()
+        cache[str(uid)] = entry
+        _save_token_cache(cache)
     print_success(f"[CACHE] Saved credentials for UID {uid}")
 
-def cache_invalidate(uid: str):
-    cache = _load_token_cache()
-    if str(uid) in cache:
-        del cache[str(uid)]
-        _save_token_cache(cache)
-        print_warning(f"[CACHE] Invalidated: {uid}")
+async def cache_invalidate(uid: str):
+    """Thread-safe async cache invalidation."""
+    async with _cache_write_lock:
+        cache = _load_token_cache()
+        if str(uid) in cache:
+            del cache[str(uid)]
+            _save_token_cache(cache)
+    print_warning(f"[CACHE] Invalidated: {uid}")
+
 
 
 # ==================== ENCRYPTION & PROTOBUF ====================
@@ -476,27 +491,49 @@ async def get_playstore_version():
     )
     return result.get("version")
 
+# Global version config cache — all accounts share one fetch (10-min TTL)
+# Prevents N×(Google Play + ggwhitehawk) slow hits when N accounts login at once
+_version_config_cache: Optional[Tuple] = None
+_version_config_cache_time: float = 0.0
+_VERSION_CONFIG_TTL = 600.0  # 10 minutes
+_version_config_lock = asyncio.Lock()
+
 async def version_config():
-    app_version = await get_playstore_version()
-    api_url = (
-        "https://version.ggwhitehawk.com/live/ver.php"
-        f"?version={app_version}"
-        "&lang=hi&device=android&channel=android"
-        "&appstore=googleplay&region=BD"
-        "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"
-    )
-    try:
-        response = await client.get(api_url)
-        response.raise_for_status()
-        data = response.json()
-        server_url = data.get("server_url")
-        remote_version = data.get("remote_version")
-        latest_release_version = data.get("latest_release_version")
-        if not server_url or not remote_version or not latest_release_version:
+    global _version_config_cache, _version_config_cache_time
+    now = time.time()
+    # Fast path: return cached result without lock
+    if _version_config_cache and (now - _version_config_cache_time) < _VERSION_CONFIG_TTL:
+        return _version_config_cache
+    # Slow path: only one account fetches, others wait and reuse result
+    async with _version_config_lock:
+        # Re-check inside lock (another account may have fetched while we waited)
+        now = time.time()
+        if _version_config_cache and (now - _version_config_cache_time) < _VERSION_CONFIG_TTL:
+            return _version_config_cache
+        app_version = await get_playstore_version()
+        api_url = (
+            "https://version.ggwhitehawk.com/live/ver.php"
+            f"?version={app_version}"
+            "&lang=hi&device=android&channel=android"
+            "&appstore=googleplay&region=BD"
+            "&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"
+        )
+        try:
+            response = await client.get(api_url)
+            response.raise_for_status()
+            data = response.json()
+            server_url = data.get("server_url")
+            remote_version = data.get("remote_version")
+            latest_release_version = data.get("latest_release_version")
+            if not server_url or not remote_version or not latest_release_version:
+                return None
+            result = (latest_release_version, remote_version, server_url)
+            _version_config_cache = result
+            _version_config_cache_time = time.time()
+            return result
+        except Exception:
             return None
-        return latest_release_version, remote_version, server_url
-    except Exception:
-        return None
+
 
 async def get_access_token(uid, password):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
@@ -1290,8 +1327,8 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 sock.close()
             except Exception:
                 pass
-        remaining = await _dec_match(uid_str)
-        total = await _get_total_match_count()
+        remaining = _dec_match(uid_str)
+        total = _get_total_match_count()
         print_info(
             f"[MATCH #{match_index}] Closed. "
             f"UID active: {remaining} | Total active: {total}"
@@ -1351,9 +1388,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         print_warning(f"[FUNCTIONAL] Cache miss for {uid_str} → re-login needed")
                         try:
                             if current_account_data.get('auth_uid'):
-                                cache_invalidate(str(current_account_data['auth_uid']))
+                                asyncio.create_task(cache_invalidate(str(current_account_data['auth_uid'])))
                             if current_account_data.get('auth_token'):
-                                cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}")
+                                asyncio.create_task(cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}"))
                         except Exception:
                             pass
                         raise ConnectionError("Cache expired, triggering fresh login")
@@ -1394,7 +1431,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                             current_key, current_iv
                         )
                         print_success("[LONE WOLF] StartMatch packet sent")
-                        active = await _get_match_count(uid_str)
+                        active = _get_match_count(uid_str)
                         try:
                             bot_state.update_status(uid_str, "SEARCHING", active)
                         except Exception:
@@ -1408,7 +1445,7 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 while True:
                     play_matches[:] = [m for m in play_matches if not m.done()]
 
-                    active_count = await _get_match_count(uid_str)
+                    active_count = _get_match_count(uid_str)
                     try:
                         bot_state.update_status(
                             uid_str,
@@ -1484,8 +1521,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                     access_token=acc_tok
                                 )
 
-                                match_index = await _inc_match(uid_str)
-                                total = await _get_total_match_count()
+                                match_index = _inc_match(uid_str)
+                                total = _get_total_match_count()
                                 print_colored(
                                     f"🚀 [MATCH #{match_index}] UDP starting → {server_ip_port} (background)",
                                     Colors.CYAN
@@ -1544,9 +1581,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                     if current_account_data:
                                         try:
                                             if current_account_data.get('auth_uid'):
-                                                cache_invalidate(str(current_account_data['auth_uid']))
+                                                asyncio.create_task(cache_invalidate(str(current_account_data['auth_uid'])))
                                             if current_account_data.get('auth_token'):
-                                                cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}")
+                                                asyncio.create_task(cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}"))
                                         except Exception:
                                             pass
                                     consecutive_parse_failures = 0
@@ -1566,9 +1603,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                                 if current_account_data:
                                     try:
                                         if current_account_data.get('auth_uid'):
-                                            cache_invalidate(str(current_account_data['auth_uid']))
+                                            asyncio.create_task(cache_invalidate(str(current_account_data['auth_uid'])))
                                         if current_account_data.get('auth_token'):
-                                            cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}")
+                                            asyncio.create_task(cache_invalidate(f"tok_{current_account_data['auth_token'][:20]}"))
                                     except Exception:
                                         pass
                                 consecutive_parse_failures = 0
@@ -1846,7 +1883,7 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
             'auth_password': password
         }
         _register_credentials(account_data)
-        cache_set(uid, account_data)
+        await cache_set(uid, account_data)
         return account_data
     except Exception as e:
         print_error(f"process_account_uid_pass error: {e}")
@@ -1880,7 +1917,6 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             return None
         release_version, client_version, server_url = verconfig_res
 
-        import requests
         url = f"https://100067.connect.garena.com/oauth/token/inspect?token={access_token}"
         hdrs = {
             "Accept-Encoding": "gzip, deflate, br",
@@ -1889,7 +1925,8 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             "Host": "100067.connect.garena.com",
             "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)"
         }
-        resp = await asyncio.to_thread(requests.get, url, headers=hdrs, timeout=10)
+        # Use existing async httpx client instead of synchronous requests + thread
+        resp = await client.get(url, headers=hdrs, timeout=10)
         data = resp.json()
 
         if 'error' in data:
@@ -1959,7 +1996,7 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
             'auth_token': access_token
         }
         _register_credentials(account_data)
-        cache_set(cache_key, account_data)
+        await cache_set(cache_key, account_data)
         return account_data
     except Exception as e:
         print_error(f"process_account_token error: {e}")

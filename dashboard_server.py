@@ -281,6 +281,32 @@ async def handle_refresh_account(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
+async def handle_export_account(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        uid = str(data.get("uid")).strip()
+        
+        # 1. Fetch live profile stats
+        acc_stats = bot_state.accounts.get(uid)
+        
+        # 2. Try to fetch credentials using the game UID (for token-based) or auth_uid (for guest)
+        creds = bot_state.account_credentials.get(uid)
+        if not creds:
+            # If not found directly by game UID, search all credentials to find the matching account_id
+            for c_uid, c_data in bot_state.account_credentials.items():
+                if str(c_data.get("account_id")) == uid:
+                    creds = c_data
+                    break
+                    
+        return web.json_response({
+            "status": "ok",
+            "account": acc_stats,
+            "credentials": creds
+        })
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app = web.Application()
     app.router.add_get("/", handle_index)
@@ -288,6 +314,7 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
+    app.router.add_post("/api/account/export", handle_export_account)
 
     runner = web.AppRunner(app)
     await runner.setup()

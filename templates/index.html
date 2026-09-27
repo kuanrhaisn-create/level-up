@@ -8,6 +8,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <style>
         :root {
             --bg-base: #060913;
@@ -876,6 +877,7 @@
                                 <div class="acc-actions">
                                     <span>Last match: ${acc.last_match_time || 'Running...'}</span>
                                     <div class="action-btns">
+                                        <button class="icon-btn" title="Download Full Info (PDF)" onclick="downloadAccountPDF('${acc.uid}')"><i class="fa-solid fa-file-pdf"></i></button>
                                         <button class="icon-btn" title="Refresh Profile/EXP" onclick="refreshAccountInfo('${acc.uid}')"><i class="fa-solid fa-rotate"></i></button>
                                         <button class="icon-btn danger" title="Delete Account" onclick="deleteAccount('${acc.uid}')"><i class="fa-solid fa-trash"></i></button>
                                     </div>
@@ -894,6 +896,143 @@
 
             } catch (err) {
                 console.error("Failed to fetch stats:", err);
+            }
+        }
+
+        async function downloadAccountPDF(uid) {
+            try {
+                // Fetch real-time export data
+                const res = await fetch('/api/account/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ uid })
+                });
+                const data = await res.json();
+                
+                if (data.status !== 'ok') {
+                    alert('Error exporting account: ' + (data.error || 'Unknown'));
+                    return;
+                }
+
+                const { jsPDF } = window.jspdf;
+                const doc = new jsPDF();
+                
+                const acc = data.account || {};
+                const creds = data.credentials || {};
+                
+                // --- PDF Styling & Content ---
+                
+                // Header Background
+                doc.setFillColor(6, 9, 19);
+                doc.rect(0, 0, 210, 40, 'F');
+                
+                // Title
+                doc.setTextColor(0, 242, 254);
+                doc.setFontSize(22);
+                doc.setFont("helvetica", "bold");
+                doc.text("TEAM 84FF", 15, 20);
+                
+                doc.setTextColor(255, 255, 255);
+                doc.setFontSize(14);
+                doc.setFont("helvetica", "normal");
+                doc.text("| ACCOUNT REPORT", 65, 20);
+                
+                doc.setTextColor(142, 155, 181);
+                doc.setFontSize(10);
+                doc.text("Generated: " + new Date().toLocaleString(), 15, 30);
+                
+                // Body Background (White for PDF)
+                doc.setTextColor(20, 20, 20);
+                
+                let y = 50;
+                
+                // 1. GAME STATS (from Image 1 request)
+                doc.setFontSize(16);
+                doc.setFont("helvetica", "bold");
+                doc.text("1. Live Account Statistics", 15, y);
+                y += 10;
+                
+                doc.setFontSize(12);
+                doc.setFont("helvetica", "normal");
+                
+                const statsList = [
+                    ["Nickname", acc.nickname || "Unknown"],
+                    ["UID", acc.uid || uid],
+                    ["Region", acc.region || "Unknown"],
+                    ["Current Level", String(acc.level || "Unknown")],
+                    ["Matches Played", String(acc.matches_played || 0)],
+                    ["Initial EXP", String(acc.initial_exp || 0)],
+                    ["Current EXP", String(acc.current_exp || 0)],
+                    ["EXP Gained", "+" + String(acc.gained_exp || 0) + " EXP"]
+                ];
+                
+                statsList.forEach(([label, value]) => {
+                    doc.setFont("helvetica", "bold");
+                    doc.text(label + ":", 15, y);
+                    doc.setFont("helvetica", "normal");
+                    doc.text(value, 60, y);
+                    y += 8;
+                });
+                
+                y += 10;
+                doc.setDrawColor(200, 200, 200);
+                doc.line(15, y, 195, y);
+                y += 15;
+                
+                // 2. CREDENTIALS (from Image 2 request)
+                doc.setFontSize(16);
+                doc.setFont("helvetica", "bold");
+                doc.text("2. Login Credentials", 15, y);
+                y += 10;
+                
+                doc.setFontSize(12);
+                doc.setFont("helvetica", "normal");
+                
+                if (creds.auth_type === 'guest') {
+                    doc.setFont("helvetica", "bold");
+                    doc.text("Account Type:", 15, y);
+                    doc.setFont("helvetica", "normal");
+                    doc.text("Guest Account (UID + Password)", 60, y);
+                    y += 10;
+                    
+                    doc.setFont("helvetica", "bold");
+                    doc.text("Guest UID:", 15, y);
+                    doc.setFont("helvetica", "normal");
+                    doc.text(String(creds.auth_uid || "Not found"), 60, y);
+                    y += 10;
+                    
+                    doc.setFont("helvetica", "bold");
+                    doc.text("Guest Password:", 15, y);
+                    doc.setFont("helvetica", "normal");
+                    doc.text(String(creds.auth_password || "Not found"), 60, y);
+                    
+                } else if (creds.auth_type === 'token') {
+                    doc.setFont("helvetica", "bold");
+                    doc.text("Account Type:", 15, y);
+                    doc.setFont("helvetica", "normal");
+                    doc.text("Access Token", 60, y);
+                    y += 10;
+                    
+                    doc.setFont("helvetica", "bold");
+                    doc.text("Access Token:", 15, y);
+                    doc.setFont("helvetica", "normal");
+                    
+                    // Token can be very long, split into multiple lines
+                    const token = String(creds.auth_token || "Not found");
+                    const splitToken = doc.splitTextToSize(token, 135);
+                    doc.text(splitToken, 60, y);
+                } else {
+                    doc.setTextColor(255, 50, 50);
+                    doc.text("Warning: Complete credentials not found in memory cache.", 15, y);
+                    doc.text("This happens if the bot was restarted and loaded from the tokens file instead of Add Modal.", 15, y+8);
+                }
+                
+                // Save PDF
+                doc.save(`TEAM84FF_Account_${acc.nickname || uid}.pdf`);
+                
+            } catch (err) {
+                console.error("PDF generation failed:", err);
+                alert("Failed to generate PDF. Check console.");
             }
         }
 
