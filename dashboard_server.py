@@ -297,11 +297,21 @@ async def handle_export_account(request: web.Request) -> web.Response:
                 if str(c_data.get("account_id")) == uid:
                     creds = c_data
                     break
+        
+        # Sanitize credentials to avoid "bytes is not JSON serializable" (e.g. login_payload_data)
+        safe_creds = {}
+        if creds:
+            safe_creds = {
+                "auth_type": creds.get("auth_type"),
+                "auth_uid": creds.get("auth_uid"),
+                "auth_password": creds.get("auth_password"),
+                "auth_token": creds.get("auth_token")
+            }
                     
         return web.json_response({
             "status": "ok",
             "account": acc_stats,
-            "credentials": creds
+            "credentials": safe_creds
         })
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
