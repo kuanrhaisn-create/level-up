@@ -23,6 +23,10 @@ class BotState:
         self.account_workers: Dict[str, asyncio.Task] = {}
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
+        # Tracks deleted UIDs so re-registration and log spam are blocked
+        self.deleted_uids: set = set()
+        # Maps game account_id -> worker key for reliable task cancellation
+        self.game_id_to_worker_key: Dict[str, str] = {}
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
         entry = {
@@ -35,8 +39,13 @@ class BotState:
         if len(self.logs) > self.max_logs:
             self.logs.pop(0)
 
-    def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int, likes: int = 0):
+    def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int, likes: int = 0, worker_key: Optional[str] = None):
         uid_str = str(uid)
+        # Block re-registration for deleted accounts
+        if uid_str in self.deleted_uids:
+            return
+        if worker_key:
+            self.game_id_to_worker_key[uid_str] = worker_key
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
                 "uid": uid_str,
@@ -70,6 +79,8 @@ class BotState:
 
     def update_exp(self, uid: str, current_exp: int, level: Optional[int] = None):
         uid_str = str(uid)
+        if uid_str in self.deleted_uids:
+            return
         if uid_str in self.accounts:
             acc = self.accounts[uid_str]
             old_exp = acc["current_exp"]
@@ -85,6 +96,8 @@ class BotState:
 
     def update_status(self, uid: str, status: str, active_matches: Optional[int] = None):
         uid_str = str(uid)
+        if uid_str in self.deleted_uids:
+            return
         if uid_str in self.accounts:
             self.accounts[uid_str]["status"] = status
             if active_matches is not None:
@@ -93,6 +106,8 @@ class BotState:
 
     def increment_match(self, uid: str):
         uid_str = str(uid)
+        if uid_str in self.deleted_uids:
+            return
         self.total_matches += 1
         if uid_str in self.accounts:
             self.accounts[uid_str]["matches_played"] += 1
@@ -150,12 +165,14 @@ async def handle_add_account(request: web.Request) -> web.Response:
             pwd = str(data["password"]).strip()
             if not uid or not pwd:
                 return web.json_response({"status": "error", "error": "UID and Password are required"})
+            # BUG FIX: Deduplicate in file before appending
             existing = [acc for acc in existing if str(acc.get("uid")) != uid]
             existing.append({"uid": uid, "password": pwd})
         elif "token" in data:
             token = str(data["token"]).strip()
             if not token:
                 return web.json_response({"status": "error", "error": "Token is required"})
+            # BUG FIX: Deduplicate in file before appending
             existing = [acc for acc in existing if acc.get("token") != token]
             existing.append({"token": token})
         else:
@@ -164,13 +181,20 @@ async def handle_add_account(request: web.Request) -> web.Response:
         with open(accounts_file, "w", encoding="utf-8") as f:
             json.dump(existing, f, indent=2)
 
-        bot_state.log(f"New account added: {data.get('uid') or 'Token'}", "success")
-        
-        # Trigger dynamic worker launch
+        # Determine if this account already has a running worker (re-add = restart)
+        _wkey = str(data.get("uid", "")).strip() if data.get("uid") else f"tok_{str(data.get('token',''))[:20]}"
+        is_restart = _wkey in bot_state.account_workers
+        label = data.get("uid") or "Token"
+        if is_restart:
+            bot_state.log(f"Account {label} restarted (old worker replaced).", "warning")
+        else:
+            bot_state.log(f"New account added: {label}", "success")
+
+        # Trigger dynamic worker launch (on_account_added_handler handles old-task cancellation)
         if "on_account_added" in bot_state.refresh_callbacks:
             asyncio.create_task(bot_state.refresh_callbacks["on_account_added"](data))
 
-        return web.json_response({"status": "ok"})
+        return web.json_response({"status": "ok", "restarted": is_restart})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
@@ -179,22 +203,68 @@ async def handle_delete_account(request: web.Request) -> web.Response:
     try:
         data = await request.json()
         uid = str(data.get("uid")).strip()
+
+        # Mark as deleted FIRST — blocks all re-registration & state mutations immediately
+        bot_state.deleted_uids.add(uid)
+
+        # Capture credentials and worker key BEFORE removing them
+        creds = bot_state.account_credentials.get(uid, {})
+        auth_uid   = str(creds.get("auth_uid",   "")).strip()
+        auth_token = str(creds.get("auth_token", "")).strip()
+        mapped_worker_key = bot_state.game_id_to_worker_key.get(uid)  # get BEFORE pop
+
+        # Remove from accounts.json — handles BOTH guest (uid field) and token (token field) entries
         accounts_file = "accounts.json"
         if os.path.exists(accounts_file):
-            with open(accounts_file, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            existing = [acc for acc in existing if str(acc.get("uid")) != uid]
-            with open(accounts_file, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
+            try:
+                with open(accounts_file, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
 
-        if uid in bot_state.accounts:
-            del bot_state.accounts[uid]
+                def _should_keep(acc):
+                    if str(acc.get("uid", "")) == uid:
+                        return False
+                    if auth_uid and str(acc.get("uid", "")) == auth_uid:
+                        return False
+                    if auth_token and acc.get("token", "") == auth_token:
+                        return False
+                    return True
 
-        if uid in bot_state.account_workers:
-            bot_state.account_workers[uid].cancel()
-            del bot_state.account_workers[uid]
+                existing = [acc for acc in existing if _should_keep(acc)]
+                with open(accounts_file, "w", encoding="utf-8") as f:
+                    json.dump(existing, f, indent=2)
+            except Exception:
+                pass
 
-        bot_state.log(f"Account {uid} removed from rotation.", "warning", uid)
+        # Remove from live accounts dict
+        bot_state.accounts.pop(uid, None)
+
+        # Clean ALL credential entries for this account (stored under multiple keys)
+        bot_state.account_credentials.pop(uid, None)
+        if auth_uid:
+            bot_state.account_credentials.pop(auth_uid, None)
+        if auth_token:
+            bot_state.account_credentials.pop(f"tok_{auth_token[:20]}", None)
+
+        # Clean mapping
+        bot_state.game_id_to_worker_key.pop(uid, None)
+
+        # Cancel worker — try every possible key this account could be stored under
+        _tok_key = f"tok_{auth_token[:20]}" if auth_token else None
+        _candidate_keys = [k for k in [mapped_worker_key, uid, auth_uid, _tok_key] if k]
+        _seen = set()
+        for key in _candidate_keys:
+            if key in _seen:
+                continue
+            _seen.add(key)
+            if key in bot_state.account_workers:
+                try:
+                    bot_state.account_workers[key].cancel()
+                except Exception:
+                    pass
+                del bot_state.account_workers[key]
+
+        bot_state.recalc_totals()
+        bot_state.log(f"Account {uid} deleted and stopped.", "warning", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})

@@ -35,7 +35,7 @@ from dashboard_server import bot_state, start_web_dashboard
 
 # ==================== CONFIGURATION ====================
 WEB_HOST = "0.0.0.0"
-WEB_PORT = 20335
+WEB_PORT = int(os.environ.get("PORT", 20335))
 ACCOUNTS_FILE = "accounts.json"
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"  # 🔥 NEW: Persistent device storage
@@ -1725,6 +1725,11 @@ async def refresh_account_profile(account_data_or_uid: Any):
         if not account_data:
             return
 
+        acc_id = str(account_data.get('account_id', uid))
+        # Guard: skip entirely if account was deleted
+        if acc_id in bot_state.deleted_uids or uid in bot_state.deleted_uids:
+            return
+
         url = account_data.get('server_url')
         token = account_data.get('token')
         release_version = account_data.get('release_version')
@@ -1741,30 +1746,41 @@ async def refresh_account_profile(account_data_or_uid: Any):
             likes = int(get_proto_field(dict_res, 8, 0))
             nickname = res_proto.nickname or get_proto_field(dict_res, 4, "")
 
-            acc_id = str(account_data['account_id'])
+            # Re-check deleted status after the await (delete may have happened while we waited)
+            if acc_id in bot_state.deleted_uids:
+                return
+
             if exp > 0:
                 bot_state.update_exp(acc_id, exp, level)
-            if likes > 0 and acc_id in bot_state.accounts:
+            if likes > 0 and acc_id in bot_state.accounts and acc_id not in bot_state.deleted_uids:
                 bot_state.accounts[acc_id]["likes"] = likes
-            if nickname and acc_id in bot_state.accounts:
+            if nickname and acc_id in bot_state.accounts and acc_id not in bot_state.deleted_uids:
                 bot_state.accounts[acc_id]["nickname"] = nickname
             print_info(f"[EXP-REFRESH] UID {acc_id} -> Level: {level}, EXP: {exp}")
     except Exception as e:
         print_error(f"refresh_account_profile error: {e}")
 
 
+
+
 async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
+    # Refuse to process a deleted account
+    if str(uid) in bot_state.deleted_uids:
+        return None
     cached = cache_get(uid)
     if cached:
         print_success(f"[CACHE HIT] UID {uid} loaded from token_cache.json (no login)")
         acc_id = str(cached['account_id'])
+        if acc_id in bot_state.deleted_uids:
+            return None
         bot_state.register_account(
             uid=acc_id,
             nickname=cached.get('nickname', f"Player_{acc_id}"),
             region=cached.get('region', 'BD'),
             level=cached.get('level', 1),
             exp=cached.get('exp', 0),
-            likes=cached.get('likes', 0)
+            likes=cached.get('likes', 0),
+            worker_key=uid
         )
         _register_credentials(cached)
         return cached
@@ -1794,13 +1810,16 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         res_proto, dict_res = getlogin_result
 
         acc_id = str(majorlogin_response.account_id)
+        # Guard: account was deleted while login was in-flight
+        if acc_id in bot_state.deleted_uids:
+            return None
         level = int(get_proto_field(dict_res, 6, 1))
         exp = int(get_proto_field(dict_res, 7, 0))
         likes = int(get_proto_field(dict_res, 8, 0))
         nickname = res_proto.nickname or get_proto_field(dict_res, 4, f"Player_{acc_id}")
         region = majorlogin_response.region or get_proto_field(dict_res, 3, "BD")
 
-        bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes)
+        bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes, worker_key=uid)
 
         account_data = {
             'account_id': majorlogin_response.account_id,
@@ -1840,13 +1859,16 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
     if cached:
         print_success(f"[CACHE HIT] Token {access_token[:10]}... loaded from cache")
         acc_id = str(cached['account_id'])
+        if acc_id in bot_state.deleted_uids:
+            return None
         bot_state.register_account(
             uid=acc_id,
             nickname=cached.get('nickname', f"Player_{acc_id}"),
             region=cached.get('region', 'BD'),
             level=cached.get('level', 1),
             exp=cached.get('exp', 0),
-            likes=cached.get('likes', 0)
+            likes=cached.get('likes', 0),
+            worker_key=cache_key
         )
         _register_credentials(cached)
         return cached
@@ -1901,13 +1923,16 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
 
         res_proto, dict_res = getlogin_result
         acc_id = str(majorlogin_response.account_id)
+        # Guard: account was deleted while token login was in-flight
+        if acc_id in bot_state.deleted_uids:
+            return None
         level = int(get_proto_field(dict_res, 6, 1))
         exp = int(get_proto_field(dict_res, 7, 0))
         likes = int(get_proto_field(dict_res, 8, 0))
         nickname = res_proto.nickname or get_proto_field(dict_res, 4, f"Player_{acc_id}")
         region = majorlogin_response.region or get_proto_field(dict_res, 3, "BD")
 
-        bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes)
+        bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes, worker_key=cache_key)
 
         account_data = {
             'account_id': majorlogin_response.account_id,
@@ -1980,6 +2005,9 @@ async def run_account_worker(account_data: Dict, label: str):
         async def exp_refresher():
             while True:
                 await asyncio.sleep(90)
+                # Stop silently if account was deleted
+                if acc_id in bot_state.deleted_uids:
+                    break
                 fresh = bot_state.account_credentials.get(acc_id)
                 if fresh:
                     await refresh_account_profile(fresh)
@@ -2020,6 +2048,9 @@ async def run_account_worker(account_data: Dict, label: str):
 async def account_loop_guest(uid: str, password: str):
     while True:
         try:
+            # Stop loop if this account was deleted from the dashboard
+            if str(uid) in bot_state.deleted_uids:
+                break
             print_info(f"[LOGIN] Starting login for Guest UID: {uid}...")
             try:
                 bot_state.update_status(str(uid), "CONNECTING")
@@ -2027,6 +2058,8 @@ async def account_loop_guest(uid: str, password: str):
                 pass
             account_data = await process_account_uid_pass(uid, password)
             if not account_data:
+                if str(uid) in bot_state.deleted_uids:
+                    break
                 print_error(f"Login failed for UID: {uid}. Retrying in 15 seconds...")
                 try:
                     bot_state.update_status(str(uid), "ERROR")
@@ -2036,6 +2069,8 @@ async def account_loop_guest(uid: str, password: str):
                 continue
 
             await run_account_worker(account_data, uid)
+            if str(uid) in bot_state.deleted_uids:
+                break
             print_warning(f"Session finished for {uid}. Reconnecting in 3s...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
@@ -2046,29 +2081,43 @@ async def account_loop_guest(uid: str, password: str):
                 pass
             break
         except Exception as e:
+            if str(uid) in bot_state.deleted_uids:
+                break
             print_error(f"Error for UID {uid}: {e}. Retrying in 10s...")
             await asyncio.sleep(10)
 
 
 async def account_loop_token(token: str):
     token_label = token[:10]
+    cache_key = f"tok_{token[:20]}"
     while True:
         try:
+            # Stop loop if this account was deleted from the dashboard
+            if cache_key in bot_state.deleted_uids:
+                break
             print_info("[LOGIN] Starting login with Access Token...")
             account_data = await process_account_token(token)
             if not account_data:
+                if cache_key in bot_state.deleted_uids:
+                    break
                 print_error("Login failed for Token. Retrying in 15 seconds...")
                 await asyncio.sleep(15)
                 continue
 
             acc_id = str(account_data['account_id'])
+            if acc_id in bot_state.deleted_uids:
+                break
             await run_account_worker(account_data, acc_id)
+            if acc_id in bot_state.deleted_uids:
+                break
             print_warning("Token session finished. Reconnecting in 3s...")
             await asyncio.sleep(3)
         except asyncio.CancelledError:
             print_warning(f"Worker for token {token_label} stopped.")
             break
         except Exception as e:
+            if cache_key in bot_state.deleted_uids:
+                break
             print_error(f"Token error: {e}. Retrying in 10s...")
             await asyncio.sleep(10)
 
@@ -2116,13 +2165,40 @@ async def main():
         print_error(f"Could not start web dashboard: {e}")
 
     async def on_account_added_handler(data):
+        def _clear_deleted_by_worker_key(wkey: str):
+            """Clear the worker key AND any game acc_ids that mapped to it from deleted_uids."""
+            bot_state.deleted_uids.discard(wkey)
+            # Reverse-lookup: find all game_ids that were mapped to this worker key and undelete them
+            for game_id, mapped_key in list(bot_state.game_id_to_worker_key.items()):
+                if mapped_key == wkey:
+                    bot_state.deleted_uids.discard(game_id)
+
         if "token" in data and data["token"]:
             t = str(data["token"]).strip()
+            cache_key = f"tok_{t[:20]}"
+            # Clear deleted flag for credential key AND any previously mapped game acc_id
+            _clear_deleted_by_worker_key(cache_key)
+            # Cancel existing worker before spawning a new one (prevents duplicate tasks)
+            if cache_key in bot_state.account_workers:
+                old_task = bot_state.account_workers.pop(cache_key)
+                try:
+                    old_task.cancel()
+                except Exception:
+                    pass
             task = asyncio.create_task(account_loop_token(t))
-            bot_state.account_workers[t[:10]] = task
+            bot_state.account_workers[cache_key] = task
         elif "uid" in data and "password" in data:
             u = str(data["uid"]).strip()
             p = str(data["password"]).strip()
+            # Clear deleted flag for credential key AND any previously mapped game acc_id
+            _clear_deleted_by_worker_key(u)
+            # Cancel existing worker before spawning a new one (prevents duplicate tasks)
+            if u in bot_state.account_workers:
+                old_task = bot_state.account_workers.pop(u)
+                try:
+                    old_task.cancel()
+                except Exception:
+                    pass
             task = asyncio.create_task(account_loop_guest(u, p))
             bot_state.account_workers[u] = task
 
@@ -2138,12 +2214,24 @@ async def main():
         print_warning(f"No accounts found in {ACCOUNTS_FILE}! Add accounts from Web Dashboard.")
         print_warning(f"Open: http://localhost:{WEB_PORT}")
 
+    # BUG FIX: Deduplicate accounts at startup to avoid multiple workers per account
+    seen_uids = set()
+    seen_tokens = set()
     for acc in accounts:
         if "token" in acc and acc["token"]:
-            t = asyncio.create_task(account_loop_token(acc["token"]))
-            bot_state.account_workers[acc["token"][:10]] = t
+            tok = acc["token"].strip()
+            if tok in seen_tokens:
+                continue
+            seen_tokens.add(tok)
+            # BUG FIX: Use consistent key format (same as on_account_added_handler)
+            _tok_key = f"tok_{tok[:20]}"
+            t = asyncio.create_task(account_loop_token(tok))
+            bot_state.account_workers[_tok_key] = t
         elif "uid" in acc and "password" in acc and acc["uid"]:
-            u = str(acc["uid"])
+            u = str(acc["uid"]).strip()
+            if u in seen_uids:
+                continue
+            seen_uids.add(u)
             t = asyncio.create_task(account_loop_guest(u, acc["password"]))
             bot_state.account_workers[u] = t
 
