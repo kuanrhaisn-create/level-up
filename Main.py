@@ -2097,7 +2097,12 @@ async def account_loop_guest(uid: str, password: str):
             if not account_data:
                 if str(uid) in bot_state.deleted_uids:
                     break
-                print_error(f"Login failed for UID: {uid}. Retrying in 15 seconds...")
+                fail_count = bot_state.report_login_fail(str(uid), "UID", password)
+                if bot_state.auto_delete_failed and fail_count >= bot_state.max_fail_limit:
+                    print_error(f"UID {uid} reached max fail limit ({bot_state.max_fail_limit}). Auto deleting...")
+                    bot_state.remove_failed_account(str(uid))
+                    break
+                print_colored(f"[-] Login failed for UID {uid}. Retrying in 15 seconds... (Fail {fail_count}/{bot_state.max_fail_limit if bot_state.auto_delete_failed else '∞'})", Colors.FAIL)
                 try:
                     bot_state.update_status(str(uid), "ERROR")
                 except Exception:
@@ -2137,7 +2142,12 @@ async def account_loop_token(token: str):
             if not account_data:
                 if cache_key in bot_state.deleted_uids:
                     break
-                print_error("Login failed for Token. Retrying in 15 seconds...")
+                fail_count = bot_state.report_login_fail(token, "Token")
+                if bot_state.auto_delete_failed and fail_count >= bot_state.max_fail_limit:
+                    print_error(f"Token {token_label} reached max fail limit ({bot_state.max_fail_limit}). Auto deleting...")
+                    bot_state.remove_failed_account(token)
+                    break
+                print_colored(f"[-] Login failed for Token {token_label}. Retrying in 15 seconds... (Fail {fail_count}/{bot_state.max_fail_limit if bot_state.auto_delete_failed else '∞'})", Colors.FAIL)
                 await asyncio.sleep(15)
                 continue
 

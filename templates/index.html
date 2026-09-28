@@ -619,6 +619,7 @@
                 </div>
             </div>
             <div class="header-actions">
+                <button class="btn btn-secondary" onclick="openSettingsModal()"><i class="fa-solid fa-gear"></i> Settings</button>
                 <button class="btn btn-secondary" onclick="fetchStats()"><i class="fa-solid fa-rotate"></i> Refresh</button>
                 <button class="btn btn-primary" onclick="openAddModal()"><i class="fa-solid fa-plus"></i> Add Account</button>
             </div>
@@ -658,18 +659,36 @@
 
         <!-- Main Dashboard -->
         <div class="dashboard-main">
-            <!-- Accounts List -->
-            <div class="card-box">
-                <div class="box-header">
-                    <div class="box-title">
-                        <i class="fa-solid fa-user-astronaut" style="color:var(--accent-cyan)"></i>
-                        <span>Live Accounts & EXP Monitor</span>
+            <div style="display: flex; flex-direction: column; gap: 24px;">
+                <!-- Accounts List -->
+                <div class="card-box">
+                    <div class="box-header">
+                        <div class="box-title">
+                            <i class="fa-solid fa-user-astronaut" style="color:var(--accent-cyan)"></i>
+                            <span>Live Accounts & EXP Monitor</span>
+                        </div>
+                    </div>
+                    <div class="accounts-list" id="accounts-container">
+                        <div class="empty-state">
+                            <i class="fa-solid fa-circle-notch fa-spin"></i>
+                            <p>Loading active accounts...</p>
+                        </div>
                     </div>
                 </div>
-                <div class="accounts-list" id="accounts-container">
-                    <div class="empty-state">
-                        <i class="fa-solid fa-circle-notch fa-spin"></i>
-                        <p>Loading active accounts...</p>
+
+                <!-- Failed Accounts -->
+                <div class="card-box" style="border-color: rgba(255, 51, 102, 0.3);">
+                    <div class="box-header">
+                        <div class="box-title">
+                            <i class="fa-solid fa-user-xmark" style="color:var(--accent-red)"></i>
+                            <span style="color:var(--accent-red)">Failed Logins</span>
+                        </div>
+                    </div>
+                    <div class="accounts-list" id="failed-accounts-container">
+                        <div class="empty-state" style="padding: 20px;">
+                            <i class="fa-solid fa-shield-check" style="color:var(--accent-green); font-size: 32px;"></i>
+                            <p style="margin-top: 10px;">No failed logins.</p>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -729,6 +748,33 @@
         </div>
     </div>
 
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settings-modal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3><i class="fa-solid fa-gear" style="color:var(--accent-amber); margin-right:8px;"></i> Bot Settings</h3>
+                <button class="icon-btn" onclick="closeSettingsModal()"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <form id="settings-form" onsubmit="submitSettings(event)">
+                <div class="form-group">
+                    <label>Failed Logins Handling</label>
+                    <select class="form-input" id="set-auto-delete">
+                        <option value="false">Manual Mode (Keep Retrying)</option>
+                        <option value="true">Auto Mode (Delete ID automatically after max fails)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Max Fail Limit</label>
+                    <input type="number" class="form-input" id="set-max-fail" value="10" min="1">
+                </div>
+                <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeSettingsModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary"><i class="fa-solid fa-check"></i> Save Settings</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
         let startTime = Date.now();
 
@@ -738,6 +784,14 @@
 
         function closeAddModal() {
             document.getElementById('add-modal').classList.remove('active');
+        }
+
+        function openSettingsModal() {
+            document.getElementById('settings-modal').classList.add('active');
+        }
+
+        function closeSettingsModal() {
+            document.getElementById('settings-modal').classList.remove('active');
         }
 
         function toggleFormType() {
@@ -792,6 +846,41 @@
             } catch (err) {
                 console.error(err);
             }
+        }
+
+        async function submitSettings(e) {
+            e.preventDefault();
+            const auto_delete = document.getElementById('set-auto-delete').value === 'true';
+            const max_limit = parseInt(document.getElementById('set-max-fail').value) || 10;
+            
+            try {
+                const res = await fetch('/api/settings/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ auto_delete, max_limit })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    closeSettingsModal();
+                    fetchStats();
+                } else {
+                    alert('Error saving settings: ' + data.error);
+                }
+            } catch (err) {
+                alert('Request failed: ' + err);
+            }
+        }
+        
+        async function deleteFailedAccount(id) {
+            if (!confirm('Permanently delete this failed account and stop retrying?')) return;
+            try {
+                await fetch('/api/failed/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id })
+                });
+                fetchStats();
+            } catch(e) { console.error(e); }
         }
 
         async function refreshAccountInfo(uid) {
@@ -880,6 +969,48 @@
                                         <button class="icon-btn" title="Download Full Info (PDF)" onclick="downloadAccountPDF('${acc.uid}')"><i class="fa-solid fa-file-pdf"></i></button>
                                         <button class="icon-btn" title="Refresh Profile/EXP" onclick="refreshAccountInfo('${acc.uid}')"><i class="fa-solid fa-rotate"></i></button>
                                         <button class="icon-btn danger" title="Delete Account" onclick="deleteAccount('${acc.uid}')"><i class="fa-solid fa-trash"></i></button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                }
+
+                // Update Settings Modal UI
+                if (data.settings && !document.getElementById('settings-modal').classList.contains('active')) {
+                    document.getElementById('set-auto-delete').value = data.settings.auto_delete ? "true" : "false";
+                    document.getElementById('set-max-fail').value = data.settings.max_limit;
+                }
+
+                // Render Failed Accounts
+                const failedContainer = document.getElementById('failed-accounts-container');
+                if (!data.failed_accounts || data.failed_accounts.length === 0) {
+                    failedContainer.innerHTML = `
+                        <div class="empty-state" style="padding: 20px;">
+                            <i class="fa-solid fa-shield-check" style="color:var(--accent-green); font-size: 32px;"></i>
+                            <p style="margin-top: 10px;">No failed logins.</p>
+                        </div>
+                    `;
+                } else {
+                    failedContainer.innerHTML = data.failed_accounts.map(acc => {
+                        return `
+                            <div class="account-card" style="border-color: rgba(255, 51, 102, 0.2);">
+                                <div class="acc-top">
+                                    <div class="acc-profile">
+                                        <div class="acc-avatar" style="color:var(--accent-red); border-color:var(--accent-red)"><i class="fa-solid fa-user-xmark"></i></div>
+                                        <div class="acc-info">
+                                            <h4 style="color:var(--accent-red)">Login Failed</h4>
+                                            <span>${acc.type === 'UID' ? 'UID' : 'Token'}: ${acc.id.length > 20 ? acc.id.substring(0,20)+'...' : acc.id}</span>
+                                        </div>
+                                    </div>
+                                    <div class="acc-status" style="background: rgba(255, 51, 102, 0.1); color: var(--accent-red); border: 1px solid rgba(255, 51, 102, 0.3);">
+                                        <span>Failed ${acc.fail_count}x</span>
+                                    </div>
+                                </div>
+                                <div class="acc-actions" style="border-top-color: rgba(255, 51, 102, 0.1);">
+                                    <span>Last fail: ${acc.last_fail || 'Just now'}</span>
+                                    <div class="action-btns">
+                                        <button class="icon-btn danger" title="Delete Account Permanently" onclick="deleteFailedAccount('${acc.id}')"><i class="fa-solid fa-trash"></i></button>
                                     </div>
                                 </div>
                             </div>

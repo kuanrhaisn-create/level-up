@@ -27,6 +27,42 @@ class BotState:
         self.deleted_uids: set = set()
         # Maps game account_id -> worker key for reliable task cancellation
         self.game_id_to_worker_key: Dict[str, str] = {}
+        
+        # --- NEW: Failed login tracking ---
+        self.failed_logins: Dict[str, dict] = {} 
+        self.auto_delete_failed = False
+        self.max_fail_limit = 10
+        
+    def report_login_fail(self, identifier: str, acc_type: str, password: str = ""):
+        if identifier in self.deleted_uids:
+            return 0
+        if identifier not in self.failed_logins:
+            self.failed_logins[identifier] = {
+                "id": identifier,
+                "type": acc_type,
+                "password": password,
+                "fail_count": 0,
+                "last_fail": ""
+            }
+        self.failed_logins[identifier]["fail_count"] += 1
+        self.failed_logins[identifier]["last_fail"] = time.strftime("%H:%M:%S")
+        self.log(f"Login failed for {acc_type} {identifier}. (Fail {self.failed_logins[identifier]['fail_count']}/{self.max_fail_limit if self.auto_delete_failed else '∞'})", "error")
+        return self.failed_logins[identifier]["fail_count"]
+
+    def remove_failed_account(self, identifier: str):
+        self.deleted_uids.add(identifier)
+        if identifier in self.failed_logins:
+            del self.failed_logins[identifier]
+        accounts_file = "accounts.json"
+        if os.path.exists(accounts_file):
+            try:
+                with open(accounts_file, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                existing = [acc for acc in existing if str(acc.get("uid", "")) != identifier and str(acc.get("token", "")) != identifier]
+                with open(accounts_file, "w", encoding="utf-8") as f:
+                    json.dump(existing, f, indent=2)
+            except Exception:
+                pass
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
         entry = {
@@ -143,6 +179,11 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "total_matches": bot_state.total_matches,
         "total_gained_exp": bot_state.total_gained_exp,
         "accounts": accounts_data,
+        "failed_accounts": list(bot_state.failed_logins.values()),
+        "settings": {
+            "auto_delete": bot_state.auto_delete_failed,
+            "max_limit": bot_state.max_fail_limit
+        },
         "logs": bot_state.logs[-60:],
         "uptime": int(time.time() - bot_state.start_time)
     })
@@ -317,6 +358,27 @@ async def handle_export_account(request: web.Request) -> web.Response:
         return web.json_response({"status": "error", "error": str(e)})
 
 
+async def handle_update_settings(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        if "auto_delete" in data:
+            bot_state.auto_delete_failed = bool(data["auto_delete"])
+        if "max_limit" in data:
+            bot_state.max_fail_limit = int(data["max_limit"])
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
+async def handle_delete_failed(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        identifier = str(data.get("id")).strip()
+        bot_state.remove_failed_account(identifier)
+        bot_state.log(f"Manually deleted failed account {identifier}", "warning")
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)})
+
 async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app = web.Application()
     app.router.add_get("/", handle_index)
@@ -325,6 +387,8 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
     app.router.add_post("/api/account/export", handle_export_account)
+    app.router.add_post("/api/settings/update", handle_update_settings)
+    app.router.add_post("/api/failed/delete", handle_delete_failed)
 
     runner = web.AppRunner(app)
     await runner.setup()
